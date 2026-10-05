@@ -12,6 +12,9 @@ In **Ghouls & Graveyards**, you step into an unexplored underground dungeon. The
 
 You can play **Solo** against the AI-controlled ghost or **Head-to-Head (Local 2-Player Hotseat)** against a rival warrior.
 
+<img width="910" height="631" alt="Screenshot 2026-10-05 103826" src="https://github.com/user-attachments/assets/518c79e7-3293-458f-92cf-0e9e6c6475f8" />
+
+
 ---
 
 ## ✨ Features
@@ -30,6 +33,10 @@ You can play **Solo** against the AI-controlled ghost or **Head-to-Head (Local 2
   - Dual announcer voices (Synthesised vs. Natural voice toggle).
   - Runtime synthesised procedural audio jingles for warrior victories.
   - Custom UI elements: step footprints, live counters, custom sprites, and interactive drag-and-drop elements.
+
+
+<img width="907" height="633" alt="Screenshot 2026-10-05 103930" src="https://github.com/user-attachments/assets/326fd95f-a66a-4f39-ae61-2867e43caa0c" />
+
 
 ---
 
@@ -55,6 +62,10 @@ You can play **Solo** against the AI-controlled ghost or **Head-to-Head (Local 2
 
 ### 4. Winning the Game
 - Successfully carry the treasure all the way back to **your own Secret Room** to claim victory!
+
+
+<img width="908" height="629" alt="Screenshot 2026-10-05 103953" src="https://github.com/user-attachments/assets/58741e7d-c17e-43b2-9511-bb1eecca53ec" />
+
 
 ---
 
