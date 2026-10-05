@@ -82,6 +82,8 @@ You can play **Solo** against the AI-controlled ghost or **Head-to-Head (Local 2
 
 ## 💻 Installation & Running
 
+Windows executable is also provided in the Release section.
+
 ### Prerequisites
 Make sure you have **Python 3.8+** installed along with the required dependencies.
 
