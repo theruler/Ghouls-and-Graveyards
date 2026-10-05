@@ -31,9 +31,10 @@ MAP_BG       = "#2a2a2e"
 
 MAX_WALLS        = 50
 EXTRA_PASSAGES   = 12
-MIN_BASE_DIST    = 4
-MIN_TREAS_DIST   = 3          # treasure room is always >= 3 squares from every Secret Room
-DRAGON_WAKE_DIST = 3
+MIN_TREAS_DIST   = 3          # the treasure is always >= 3 squares from every Secret Room
+MIN_GHOST_TREAS  = 3          # ... and the sleeping ghost is always >= 3 squares from the treasure
+DRAGON_WAKE_DIST = 3          # a hero can wake the ghost from this distance
+WAKE_CHANCE      = {3: 0.25, 2: 0.50, 1: 1.0}   # chance to wake per hero step, by distance from the ghost
 STEPS_BY_LIVES   = {3: 8, 2: 6, 1: 4, 0: 0}
 TREASURE_STEPS   = 4          # moves per turn while carrying the treasure
 PHANTOM_DOORS    = 4          # max closed doors at the same time
@@ -46,6 +47,21 @@ ATTACK_DELAY_MS  = 600
 DELTA = {"n": (-1,0), "s": (1,0), "e": (0,1), "w": (0,-1)}
 OPP   = {"n":"s", "s":"n", "e":"w", "w":"e"}
 DIRS  = list(DELTA.keys())
+CELLS = [(r, c) for r in range(ROWS) for c in range(COLS)]
+
+def in_grid(r, c): return 0 <= r < ROWS and 0 <= c < COLS
+def step(r, c, d): return r + DELTA[d][0], c + DELTA[d][1]
+def manhattan(r1, c1, r2, c2): return abs(r1-r2) + abs(c1-c2)
+
+def neighbors(r, c):
+    """(direction, row, col) of every neighbouring tile inside the grid."""
+    for d in DIRS:
+        nr, nc = step(r, c, d)
+        if in_grid(nr, nc): yield d, nr, nc
+
+def far_cells(rules):
+    """Every tile at least `dist` squares away from each (cell, dist) in rules."""
+    return [(r, c) for r, c in CELLS if all(manhattan(r, c, *a) >= dist for a, dist in rules)]
 
 C = dict(
     bg           = "#160c08",
@@ -89,9 +105,11 @@ SND_FILES = {
 TIPS = {
     "r0": "Player 1's Secret Room. Drag it onto the map; you can keep moving it until the game starts. "
           "The ghost can't find you inside your own room, but you are not safe in your opponent's.",
-    "r1": "Player 2's Secret Room. Drag it onto the map; you can keep moving it until the game starts. "
+    "r1": "Player 2's Secret Room. It lights up once Player 1's room is on the map; then drag it on too. "
+          "You can keep moving it until the game starts. "
           "The ghost can't find you inside your own room, but you are not safe in your opponent's.",
-    "g":  "Ghost marker. Drag it onto the map to mark where you think the ghost is. It can't be removed, "
+    "g":  "Ghost marker (active once the game has started). Drag it onto the map to mark where you think "
+          "the ghost is. It can't be removed, "
           "only moved. It also lands by itself on the tile where the ghost attacks.",
     "start": "Start the game. One Secret Room on the map = 1-player game; two rooms = 2-player game. "
              "The dungeon and the treasure room are generated when you press it.",
@@ -188,14 +206,14 @@ _audio_play, _audio_busy = _build_audio_backend()
 
 class SoundQueue:
     """Plays immediately and interrupts the previous sound."""
-    def __init__(self, root, voice="sayit"):
+    def __init__(self, root, voice="Robo"):
         self.root = root; self.voice = voice
         self.on_caption = lambda s: None
 
     def _path(self, key):
         files = SND_FILES.get(key, [])
         if not files: return None
-        idx = 0 if self.voice == "sayit" else 1
+        idx = 0 if self.voice == "Robo" else 1
         return os.path.join(SOUND_DIR, files[idx] if idx < len(files) else files[0])
 
     def push(self, key):
@@ -269,6 +287,9 @@ SP_P2      = 37
 SP_TITLE   = 47
 SP_STEP_AV = 51
 SP_STEP_US = 52
+SP_BASE    = (SP_BASE_P1, SP_BASE_P2)
+SP_HERO    = (SP_P1, SP_P2)
+P_COL      = (C["base_p1"], C["base_p2"])
 
 
 class Tip:
@@ -369,46 +390,77 @@ class Cell:
     def passable(self, d): return not self.walls[d] and not self.door_closed[d]
     def open_count(self):  return sum(1 for d in DIRS if not self.walls[d])
 
-def _carve(grid, r, c, d):
-    grid[r][c].walls[d] = False
-    nr,nc = r+DELTA[d][0], c+DELTA[d][1]
-    grid[nr][nc].walls[OPP[d]] = False
+def _carve(grid, r, c, d, opened=True):
+    nr, nc = step(r, c, d)
+    grid[r][c].walls[d] = not opened
+    grid[nr][nc].walls[OPP[d]] = not opened
 
-def generate_maze(tr, tc):
-    grid = [[Cell(r,c) for c in range(COLS)] for r in range(ROWS)]
-    sr,sc = random.randrange(ROWS), random.randrange(COLS)
+def _walls(grid):
+    """Every interior wall exactly once, as (r, c, d) with d in ('s', 'e')."""
+    return [(r, c, d) for r, c in CELLS for d in ("s", "e")
+            if in_grid(*step(r, c, d)) and grid[r][c].walls[d]]
+
+def disjoint_paths(grid, src, dst, limit=2):
+    """How many routes (up to `limit`) lead from src to dst without sharing any intermediate tile.
+    Max-flow with unit capacities on a split-node graph; closed doors count as walls."""
+    cap, adj = {}, {}
+    def link(a, b):
+        cap[(a, b)] = cap.get((a, b), 0) + 1; cap.setdefault((b, a), 0)
+        adj.setdefault(a, []).append(b); adj.setdefault(b, []).append(a)
+    for r, c in CELLS:
+        link(("in", r, c), ("out", r, c))
+        for d, nr, nc in neighbors(r, c):
+            if grid[r][c].passable(d): link(("out", r, c), ("in", nr, nc))
+    s, t = ("out",) + tuple(src), ("in",) + tuple(dst)
+    flow = 0
+    while flow < limit:
+        prev = {s: None}; queue = [s]
+        for u in queue:
+            for v in adj.get(u, ()):
+                if v not in prev and cap[(u, v)] > 0: prev[v] = u; queue.append(v)
+        if t not in prev: break
+        v = t
+        while prev[v] is not None:
+            u = prev[v]; cap[(u, v)] -= 1; cap[(v, u)] += 1; v = u
+        flow += 1
+    return flow
+
+def treasure_ok(grid, treasure, rooms):
+    """The treasure is never a dead end: from every Secret Room a hero can reach it by 2 different routes."""
+    return all(disjoint_paths(grid, rm, treasure) >= 2 for rm in rooms)
+
+def generate_maze(treasure, rooms):
+    grid = [[Cell(r, c) for c in range(COLS)] for r in range(ROWS)]
+    sr, sc = random.choice(CELLS)
     grid[sr][sc].seen = True
-    frontier = [(sr,sc)]
-    while frontier:
-        i = random.randrange(len(frontier)); r,c = frontier[i]
-        nbrs = [(d,r+DELTA[d][0],c+DELTA[d][1]) for d in DIRS
-                if 0<=r+DELTA[d][0]<ROWS and 0<=c+DELTA[d][1]<COLS
-                and not grid[r+DELTA[d][0]][c+DELTA[d][1]].seen]
+    frontier = [(sr, sc)]
+    while frontier:                                   # randomised Prim: a perfect maze
+        i = random.randrange(len(frontier)); r, c = frontier[i]
+        nbrs = [(d, nr, nc) for d, nr, nc in neighbors(r, c) if not grid[nr][nc].seen]
         if not nbrs: frontier.pop(i); continue
-        d,nr,nc = random.choice(nbrs)
-        _carve(grid,r,c,d); grid[nr][nc].seen=True; frontier.append((nr,nc))
+        d, nr, nc = random.choice(nbrs)
+        _carve(grid, r, c, d); grid[nr][nc].seen = True; frontier.append((nr, nc))
 
-    def count_walls():
-        return sum(1 for r in range(ROWS) for c in range(COLS) for d in ["s","e"]
-                   if 0<=r+DELTA[d][0]<ROWS and 0<=c+DELTA[d][1]<COLS and grid[r][c].walls[d])
+    added = attempts = 0                              # a few extra passages: loops and shortcuts
+    while added < EXTRA_PASSAGES and len(_walls(grid)) > MAX_WALLS and attempts < 2000:
+        attempts += 1
+        r, c = random.choice(CELLS); d = random.choice(DIRS); nr, nc = step(r, c, d)
+        if in_grid(nr, nc) and grid[r][c].walls[d]: _carve(grid, r, c, d); added += 1
 
-    added,attempts = 0,0
-    while added<EXTRA_PASSAGES and count_walls()>MAX_WALLS and attempts<2000:
-        attempts+=1; r,c=random.randrange(ROWS),random.randrange(COLS)
-        d=random.choice(DIRS); nr,nc=r+DELTA[d][0],c+DELTA[d][1]
-        if 0<=nr<ROWS and 0<=nc<COLS and grid[r][c].walls[d]:
-            _carve(grid,r,c,d); added+=1
+    def score(): return sum(disjoint_paths(grid, rm, treasure) for rm in rooms)
+    best = score()
+    while best < 2 * len(rooms):                      # open the fewest walls that give every room 2 routes
+        walls = _walls(grid); random.shuffle(walls)
+        if not walls: break
+        for r, c, d in walls:
+            _carve(grid, r, c, d); s = score()
+            if s > best: best = s; break
+            _carve(grid, r, c, d, False)
+        else:                                         # no single wall helps: open one at random and go on
+            _carve(grid, *walls[0]); best = score()
 
-    while grid[tr][tc].open_count()<2:
-        cands=[d for d in DIRS if 0<=tr+DELTA[d][0]<ROWS and 0<=tc+DELTA[d][1]<COLS and grid[tr][tc].walls[d]]
-        if not cands: break
-        _carve(grid,tr,tc,random.choice(cands))
-
-    for row in grid:
-        for cell in row: cell.seen=False
+    for r, c in CELLS: grid[r][c].seen = False
     return grid
-
-def manhattan(r1,c1,r2,c2): return abs(r1-r2)+abs(c1-c2)
 
 
 class App:
@@ -420,11 +472,12 @@ class App:
         self._fonts()
         self.tip = Tip(root, self.F["small"])
         self.phase = "title"                    # title -> setup (place the Secret Rooms) -> play
-        self.num_players = 0; self.difficulty = 1; self.voice = "sayit"
+        self.num_players = 0; self.difficulty = 1; self.voice = "Robo"
         self.grid = None; self.players = [None, None]; self.cur_p = 0
         self.rooms = [None, None]               # Secret Room tokens on the map (cells)
         self.dr = self.dc = -1                  # REAL ghost position (hidden until the game ends)
         self.dragon_awake = False
+        self.ghost_fresh = False                # just woke up: it only starts moving on its next turn
         self.tr = self.tc = -1
         self.game_over = False; self.winner = None
         self.reveal_all = False; self.doors = []
@@ -467,8 +520,7 @@ class App:
     def _build_ui(self):
         outer = tk.Frame(self.root, bg=C["bg"])
         outer.pack(padx=8, pady=8)
-        self.cv = tk.Canvas(outer, width=BOARD_W, height=BOARD_H, bg=MAP_BG,
-                            highlightthickness=2, highlightbackground=C["panel_border"])
+        self.cv = tk.Canvas(outer, width=BOARD_W, height=BOARD_H, bg=MAP_BG, highlightthickness=2, highlightbackground=C["panel_border"])
         self.cv.pack(side="left")
         self.cv.bind("<ButtonPress-1>",   self._map_press)
         self.cv.bind("<B1-Motion>",       self._drag_motion)
@@ -476,8 +528,7 @@ class App:
         self.cv.bind("<Motion>",          self._on_hover)
         self.cv.bind("<Leave>", lambda e: (self.cv.delete("hover"), self.cv.config(cursor=""), self.tip.hide()))
 
-        self.panel = tk.Frame(outer, bg=C["panel_bg"], width=PANEL_W,
-                              highlightthickness=2, highlightbackground=C["panel_border"])
+        self.panel = tk.Frame(outer, bg=C["panel_bg"], width=PANEL_W, highlightthickness=2, highlightbackground=C["panel_border"])
         self.panel.pack(side="right", fill="y", padx=(10, 0))
         self.panel.pack_propagate(False)
         self._build_panel(self.panel)
@@ -486,14 +537,13 @@ class App:
         cb = C["card_bg"]
         # whose turn
         self._turn_var = tk.StringVar(value="")
-        self._turn_lbl = tk.Label(p, textvariable=self._turn_var, font=self.F["turn"],
-                                  bg=cb, fg=C["highlight"], pady=9)
+        self._turn_lbl = tk.Label(p, textvariable=self._turn_var, font=self.F["turn"], bg=cb, fg=C["highlight"], pady=9)
         self._turn_lbl.pack(fill="x", padx=10, pady=(10, 6))
 
         # player cards
         self._pui = []
         for i in range(2):
-            pc = C["base_p1"] if i == 0 else C["base_p2"]
+            pc = P_COL[i]
             border = tk.Frame(p, bg=C["panel_sep"])
             border.pack(fill="x", padx=10, pady=3)
             card = tk.Frame(border, bg=cb, padx=10, pady=7)
@@ -508,8 +558,7 @@ class App:
             steps_cv = tk.Canvas(card, width=STEP_W, height=34, bg=cb, highlightthickness=0)
             steps_cv.pack(anchor="w", pady=(6, 0))
             sv = tk.StringVar(value="")
-            tk.Label(card, textvariable=sv, font=self.F["small"], bg=cb, fg=C["label_col"],
-                     anchor="w").pack(fill="x")
+            tk.Label(card, textvariable=sv, font=self.F["small"], bg=cb, fg=C["label_col"], anchor="w").pack(fill="x")
             self._pui.append(dict(border=border, lives=lives_cv, steps=steps_cv, treas=treas_cv, sv=sv))
 
         # message area
@@ -533,23 +582,18 @@ class App:
         self._draw_tray()
 
         # buttons
-        self._btn_end = FlatButton(p, "▷  Start game", self._end_turn, self.F["btn"], "Space",
-                                   self.F["hint"], primary=True, tip=self.tip, tip_text=TIPS["start"])
+        self._btn_end = FlatButton(p, "▷  Start game", self._end_turn, self.F["btn"], "Space", self.F["hint"], primary=True, tip=self.tip, tip_text=TIPS["start"])
         self._btn_end.pack(fill="x", padx=10, pady=(8, 3))
         row = tk.Frame(p, bg=C["panel_bg"]); row.pack(fill="x", padx=10, pady=3)
-        self._btn_l1 = FlatButton(row, "Level 1 game", lambda: self._start_setup(1), self.F["btn"],
-                                  tip=self.tip, tip_text=TIPS["l1"], center=True)
+        self._btn_l1 = FlatButton(row, "Level 1 game", lambda: self._start_setup(1), self.F["btn"], tip=self.tip, tip_text=TIPS["l1"], center=True)
         self._btn_l1.pack(side="left", expand=True, fill="x", padx=(0, 3))
-        self._btn_l2 = FlatButton(row, "Level 2 game", lambda: self._start_setup(2), self.F["btn"],
-                                  tip=self.tip, tip_text=TIPS["l2"], center=True)
+        self._btn_l2 = FlatButton(row, "Level 2 game", lambda: self._start_setup(2), self.F["btn"], tip=self.tip, tip_text=TIPS["l2"], center=True)
         self._btn_l2.pack(side="left", expand=True, fill="x", padx=(3, 0))
-        self._btn_voice = FlatButton(p, "♪  Voice: sayit", self._toggle_voice, self.F["btn"], "V",
-                                     self.F["hint"], tip=self.tip, tip_text=TIPS["voice"])
+        self._btn_voice = FlatButton(p, "♪  Voice: Robo", self._toggle_voice, self.F["btn"], "V", self.F["hint"], tip=self.tip, tip_text=TIPS["voice"])
         self._btn_voice.pack(fill="x", padx=10, pady=3)
 
         # footer
-        tk.Label(p, text="Arrows / WASD or click a neighbouring tile",
-                 font=self.F["tiny"], bg=C["panel_bg"], fg=C["dim_col"]).pack(pady=(8, 6))
+        tk.Label(p, text="Arrows / WASD or click a neighbouring tile", font=self.F["tiny"], bg=C["panel_bg"], fg=C["dim_col"]).pack()
 
     def _set_cards(self, n):
         for i, ui in enumerate(self._pui):
@@ -574,15 +618,12 @@ class App:
             cv.create_rectangle(x0, y0, x1, y1, fill=C["bg"], width=2 if (on and not placed) else 1,
                                 outline=col if on else C["dim_col"])
             cx, cy = (x0+x1)//2, (y0+y1)//2
-            ph = SPRITES.get_fit(sp, 38, 38)
-            if ph:
-                self._panel_img_refs.append(ph)
-                cv.create_image(cx, cy, anchor="center", image=ph)
-            elif tok == "g":
-                cv.create_oval(cx-17, cy-17, cx+17, cy+17, fill="#8888cc", outline="")
-            else:
-                cv.create_rectangle(cx-17, cy-17, cx+17, cy+17, outline=col, width=3)
-                cv.create_text(cx, cy, text="⌂", fill=col, font=("Georgia", 16, "bold"))
+            if not self._blit(sp, cx, cy, 38, cv=cv):
+                if tok == "g":
+                    cv.create_oval(cx-17, cy-17, cx+17, cy+17, fill="#8888cc", outline="")
+                else:
+                    cv.create_rectangle(cx-17, cy-17, cx+17, cy+17, outline=col, width=3)
+                    cv.create_text(cx, cy, text="⌂", fill=col, font=("Georgia", 16, "bold"))
             if not on:
                 cv.create_rectangle(x0, y0, x1, y1, fill=C["bg"], stipple="gray50", outline="")
             elif placed:
@@ -598,9 +639,9 @@ class App:
         else:          self.rooms[int(tok[1])] = cell
 
     def _token_enabled(self, tok):
-        if self.phase == "title": return False
-        if tok == "g": return not self.game_over
-        return self.phase == "setup"                 # Secret Rooms move only before the game starts
+        if tok == "g": return self.phase == "play" and not self.game_over      # unlocked by Start
+        # Secret Rooms move only before the game starts; Player 2's lights up after Player 1's is placed
+        return self.phase == "setup" and (tok == "r0" or self.rooms[0] is not None)
 
     def _token_at_cell(self, cell):
         if cell is None: return None
@@ -646,7 +687,13 @@ class App:
     def _tray_press(self, e):
         self.tip.hide()
         tok = self._tray_token_at(e.x, e.y)
-        if tok is None or not self._token_enabled(tok): self._press = None; return
+        if tok is None or not self._token_enabled(tok):
+            self._press = None
+            if self.phase == "setup" and tok == "r1":
+                self._say("Place Player 1's Secret Room first: then this one lights up.")
+            elif self.phase == "setup" and tok == "g":
+                self._say("The ghost marker unlocks once the game has started.")
+            return
         self._press = dict(src="tray", tok=tok, cell=None, cy=0, xy=(e.x_root, e.y_root))
         self._drag = None
 
@@ -716,8 +763,8 @@ class App:
             ok = self._token_enabled(tok)
         else:
             self.tip.hide()
-            if self.phase == "play" and not self.game_over and not self._locked and cell:
-                p = self._cur_player()
+            p = self._active_player()
+            if cell:
                 if p and manhattan(cell[0], cell[1], p["row"], p["col"]) == 1:
                     ok = True
                     x0, y0 = self._xy(*cell)
@@ -726,50 +773,37 @@ class App:
         if self.game_over and event.y > GRID_BOTTOM: ok = True
         self.cv.config(cursor="hand2" if ok else "")
 
-    # ── Panel ghost-marker drag ──────────────────────────────────────
-
-
-
-
-
-
-
-
-    def _show_title(self):
-        self.phase = "title"
-        self._img_refs.clear()
-        self.cv.delete("all")
-        self.cv.create_rectangle(0, 0, BOARD_W, BOARD_H, fill="#1a0a06", outline="")
+    # ── screens ──────────────────────────────────────────────────────
+    def _draw_banner(self, bg):
+        """Clear the board and draw the title strip."""
+        self._img_refs.clear(); self.cv.delete("all")
+        self.cv.create_rectangle(4, 4, BOARD_W, BOARD_H, fill=bg, outline="")
         ph = SPRITES.get_stretch(SP_TITLE, BOARD_W, TITLE_H)
         if ph:
             self._img_refs.append(ph)
-            self.cv.create_image(0, 0, anchor="nw", image=ph)
+            self.cv.create_image(2, 5, anchor="nw", image=ph)
         else:
             self.cv.create_rectangle(0, 0, BOARD_W, TITLE_H, fill="#0a0a0a", outline=C["panel_border"], width=2)
             self.cv.create_text(BOARD_W//2, TITLE_H//2, text="GHOULS & GRAVEYARDS",
                                 font=(self.F["title"].actual("family"), 20, "bold"), fill="#ff0000")
+
+    def _set_end_button(self, text, tip):
+        self._btn_end.set_text(text); self._btn_end.set_tip(tip)
+
+    def _show_title(self):
+        self.phase = "title"
+        self._draw_banner("#1a0a06")
         cx = BOARD_W//2; cy = TITLE_H + (BOARD_H-TITLE_H)//2
-        ph2 = SPRITES.get_fit(SP_GHOST, 90, 90)
-        if ph2:
-            self._img_refs.append(ph2)
-            self.cv.create_image(cx, cy-50, anchor="center", image=ph2)
-        else:
+        if not self._blit(SP_GHOST, cx, cy-50, 90):
             self.cv.create_oval(cx-40, cy-90, cx+40, cy-10, fill="#8888cc", outline="")
-        self.cv.create_text(cx, cy+20, text="Find the treasure, dodge the ghost,\nand bring it back to your Secret Room.",
-                            font=self.F["italic"], fill=C["text_col"], justify="center")
-        self.cv.create_text(cx, cy+80, text="Press  Level 1 game  or  Level 2 game  to begin",
-                            font=self.F["h3"], fill=C["highlight"])
-        self.cv.create_text(cx, cy+112, text="Python/Tkinter  ·  based on Mattel Electronics 1980",
-                            font=self.F["small"], fill=C["label_col"])
-        self._set_cards(2)
-        self._say("")
+        self.cv.create_text(cx, cy+20, text="Find the treasure, dodge the ghost,\nand bring it back to your Secret Room.", font=self.F["italic"], fill=C["text_col"], justify="center")
+        self.cv.create_text(cx, cy+80, text="Press  Level 1 game  or  Level 2 game  to begin", font=self.F["h3"], fill=C["highlight"])
+        self.cv.create_text(cx, cy+112, text="Python/Tkinter  ·  based on Mattel Electronics 1980", font=self.F["small"], fill=C["label_col"])
+        self._set_cards(2); self._say("")
         self._turn_var.set("Welcome, brave warrior"); self._turn_lbl.config(fg=C["highlight"])
-        self._btn_end.set_text("▷  Start game"); self._btn_end.set_tip(TIPS["start"])
-        self._btn_end.set_enabled(False)
+        self._set_end_button("▷  Start game", TIPS["start"]); self._btn_end.set_enabled(False)
         self._draw_tray()
-        for ui in self._pui:
-            self._draw_lives(ui["lives"], 0, 3); self._draw_steps(ui["steps"], 0, 8)
-            ui["treas"].delete("all"); ui["sv"].set("Waiting to start")
+        for i in range(2): self._blank_card(i, 0, "Waiting to start")
 
     def _start_setup(self, level):
         """New game at `level`: the players first drag their Secret Rooms onto the (still empty) map."""
@@ -780,72 +814,84 @@ class App:
         self.difficulty = level; self.phase = "setup"
         self.game_over = False; self.winner = None; self.reveal_all = False
         self.doors = []; self._locked = False; self._ghost_hold = None
-        self.dragon_awake = False
+        self.dragon_awake = False; self.ghost_fresh = False
         self.grid = None; self.players = [None, None]; self.num_players = 0; self.cur_p = 0
         self.tr = self.tc = self.dr = self.dc = -1
         self.rooms = [None, None]; self._ghost_panel_cell = None
         self._duel_cell = None; self._flash_wall_edge = None; self._press = None; self._drag = None
-        self._img_refs.clear(); self._panel_img_refs = []
+        self._panel_img_refs = []
         self._btn_l1.set_active(level == 1); self._btn_l2.set_active(level == 2)
-        self._btn_end.set_text("▷  Start game"); self._btn_end.set_tip(TIPS["start"])
-        self._btn_end.set_enabled(True)
+        self._set_end_button("▷  Start game", TIPS["start"]); self._btn_end.set_enabled(True)
         self._set_cards(2)
-        self._say("Drag a Secret Room onto the map: one room for a 1-player game, "
-                  "two rooms for 2 players. Then press Start game.")
+        self._say("Drag Player 1's Secret Room onto the map. Once it is placed, Player 2's room lights up "
+                  "(optional: 2-player game). Then press Start game.")
         self._update_panel(); self._full_redraw(); self._draw_tray()
 
+    @staticmethod
+    def _new_player(room):
+        return dict(base_r=room[0], base_c=room[1], row=room[0], col=room[1], lives=3, used_steps=0,
+                    max_steps=8, carrying=False, alive=True,
+                    strength=START_STRENGTH, renew_in=random.randint(*RENEW_MOVES))
+
+    @staticmethod
+    def _pick_ghost_spot(rooms, treasure):
+        """Sleeping ghost: >= MIN_GHOST_TREAS from the treasure and, when possible, out of the wake-up
+        zone of every hero's starting tile."""
+        for dist in range(DRAGON_WAKE_DIST + 1, 0, -1):
+            cands = far_cells([(rm, dist) for rm in rooms] + [(treasure, MIN_GHOST_TREAS)])
+            if cands: return random.choice(cands)
+        return treasure
+
     def _start_game(self):
-        """Rooms are placed: now (and only now) the treasure room and the dungeon are generated."""
-        placed = [c for c in self.rooms if c is not None]
+        """Rooms are placed: now (and only now) the treasure, the ghost and the dungeon are generated."""
+        placed = [c for c in self.rooms if c]            # Player 2's room can't exist without Player 1's
         if not placed:
             self._say("Drag at least one Secret Room onto the map first.", "bad"); return
         n = len(placed)
-        cands = [(r, c) for r in range(ROWS) for c in range(COLS)
-                 if all(manhattan(r, c, pr, pc) >= MIN_TREAS_DIST for pr, pc in placed)]
-        self.tr, self.tc = random.choice(cands)         # always >= 3 squares from every Secret Room
-        self.grid = generate_maze(self.tr, self.tc)     # and always >= 2 open paths into it
-        self.dr, self.dc = self.tr, self.tc             # the ghost is born in the Treasure Room, asleep
-        self.dragon_awake = False
+        treasure = random.choice(far_cells([(rm, MIN_TREAS_DIST) for rm in placed]))
+        self.tr, self.tc = treasure
+        self.dr, self.dc = self._pick_ghost_spot(placed, treasure)
+        self.grid = generate_maze(treasure, placed)      # every room has 2 different routes to the treasure
+        self.dragon_awake = False; self.ghost_fresh = False
         self.num_players = n
-        self.rooms = placed + [None] * (2 - n)          # a lone hero is always Player 1
-        self.players = [None, None]
-        for i, (br, bc) in enumerate(placed):
-            self.players[i] = dict(base_r=br, base_c=bc, row=br, col=bc, lives=3, used_steps=0,
-                                   max_steps=8, carrying=False, placed=True, alive=True, moved=False,
-                                   strength=START_STRENGTH, renew_in=random.randint(*RENEW_MOVES))
-            self._reveal_adjacent(br, bc)
+        self.players = [self._new_player(rm) for rm in placed] + [None] * (2 - n)
+        for p in self.players[:n]: self._reveal_adjacent(p["row"], p["col"])
         self.cur_p = 0; self.phase = "play"
         self._set_cards(n)
-        self._btn_end.set_text("▷  End turn"); self._btn_end.set_tip(TIPS["end"])
+        self._set_end_button("▷  End turn", TIPS["end"])
         self._say("Player 1 starts. Move with the arrow keys or click a neighbouring tile." if n == 2
                   else "Move with the arrow keys or click a neighbouring tile. Find the treasure!")
         self._update_panel(); self._full_redraw(); self._draw_tray()
 
     # ── magic doors (level 2) ────────────────────────────────────────
+    def _treasure_ok(self):
+        return treasure_ok(self.grid, (self.tr, self.tc), [rm for rm in self.rooms if rm])
+
     def _pick_door(self):
-        cands = []
-        for r in range(ROWS):
-            for c in range(COLS):
-                for d in ("n", "e"):
-                    nr, nc = r+DELTA[d][0], c+DELTA[d][1]
-                    if not (0 <= nr < ROWS and 0 <= nc < COLS): continue
-                    if self.grid[r][c].walls[d] or self.grid[r][c].is_door[d]: continue
-                    if (r, c) == (self.tr, self.tc) and self.grid[r][c].open_count() <= 2: continue
-                    if (nr, nc) == (self.tr, self.tc) and self.grid[nr][nc].open_count() <= 2: continue
-                    cands.append((r, c, d))
-        return random.choice(cands) if cands else None
+        """A random open edge that can close without leaving a Secret Room with fewer than 2 routes."""
+        cands = [(r, c, d) for r, c in CELLS for d in ("n", "e")
+                 if in_grid(*step(r, c, d)) and not self.grid[r][c].walls[d] and not self.grid[r][c].is_door[d]]
+        random.shuffle(cands)
+        for spot in cands:
+            self._set_door(*spot, True)
+            if self._treasure_ok(): return spot
+            self._set_door(*spot, False)
+        return None
 
     def _set_door(self, r, c, d, on):
-        nr, nc = r+DELTA[d][0], c+DELTA[d][1]
+        nr, nc = step(r, c, d)
         for a, b, dd in ((r, c, d), (nr, nc, OPP[d])):
             cell = self.grid[a][b]
             cell.is_door[dd] = on; cell.door_closed[dd] = on
             if not on: cell.door_shown[dd] = False      # an open door is invisible again
 
-    def _mark_door(self, r, c, d):
-        nr, nc = r+DELTA[d][0], c+DELTA[d][1]
-        self.grid[r][c].door_shown[d] = True; self.grid[r][c].seen = True
-        self.grid[nr][nc].door_shown[OPP[d]] = True
+    def _mark_edge(self, r, c, d, door):
+        """Remember a wall (or door) the warrior bumped into, on both sides of the edge."""
+        attr = "door_shown" if door else "wall_shown"
+        nr, nc = step(r, c, d)
+        self.grid[r][c].seen = True
+        getattr(self.grid[r][c], attr)[d] = True
+        if in_grid(nr, nc): getattr(self.grid[nr][nc], attr)[OPP[d]] = True
 
     def _update_doors(self):
         """Once per turn the computer decides which doors reopen and which new ones close, silently."""
@@ -861,40 +907,29 @@ class App:
                     self._set_door(*spot, True)
                     self.doors.append([spot[0], spot[1], spot[2], random.randint(*DOOR_TURNS)])
 
-    # ═════════════════════════ DRAWING ═════════════════════════
+    # ═══ DRAWING ═══
+    def _blit(self, sp, x, y, w, h=None, cv=None, anchor="center", **kw):
+        """Draw sprite `sp` fitted into w x h. Returns False when the sprite file is missing."""
+        cv = self.cv if cv is None else cv
+        ph = SPRITES.get_fit(sp, w, h or w)
+        if ph is None: return False
+        (self._img_refs if cv is self.cv else self._panel_img_refs).append(ph)
+        cv.create_image(x, y, anchor=anchor, image=ph, **kw)
+        return True
+
     def _full_redraw(self):
-        self._img_refs.clear()
-        self.cv.delete("all")
-        self.cv.create_rectangle(0, 0, BOARD_W, BOARD_H, fill=MAP_BG, outline="")
-        ph = SPRITES.get_stretch(SP_TITLE, BOARD_W, TITLE_H)
-        if ph:
-            self._img_refs.append(ph)
-            self.cv.create_image(0, 0, anchor="nw", image=ph)
-        else:
-            self.cv.create_rectangle(0, 0, BOARD_W, TITLE_H, fill="#0a0a0a", outline=C["panel_border"], width=2)
-            self.cv.create_text(BOARD_W//2, TITLE_H//2, text="GHOULS & GRAVEYARDS",
-                                font=(self.F["title"].actual("family"), 20, "bold"), fill="#ff0000")
-        for r in range(ROWS):
-            for c in range(COLS):
-                x0, y0 = self._xy(r, c)
-                ph = SPRITES.get_fit(SP_FLOOR, TILE, TILE)
-                if ph:
-                    self._img_refs.append(ph)
-                    self.cv.create_image(x0, y0, anchor="nw", image=ph)
-                else:
-                    self.cv.create_rectangle(x0, y0, x0+TILE, y0+TILE, fill="#2b1a10", outline="")
+        self._draw_banner(MAP_BG)
+        for r, c in CELLS:
+            x0, y0 = self._xy(r, c)
+            if not self._blit(SP_FLOOR, x0, y0, TILE, anchor="nw"):
+                self.cv.create_rectangle(x0, y0, x0+TILE, y0+TILE, fill="#2b1a10", outline="")
         self._draw_bases()
         if self.grid is not None:
-            self._draw_walls()
-            self._draw_doors()
-        self._draw_treasure()
-        self._draw_hints()
-        self._draw_warriors()
-        self._draw_map_ghost()
-        self._draw_real_ghost()
-        self._draw_flashes()
-        if self.game_over:
-            self._redraw_end_overlay()
+            self._draw_edges("walls", "wall_shown", SP_WALL, C["wall_col"])
+            self._draw_edges("door_closed", "door_shown", SP_DOOR, C["door_col"])
+        self._draw_treasure(); self._draw_hints(); self._draw_warriors()
+        self._draw_map_ghost(); self._draw_real_ghost(); self._draw_flashes()
+        if self.game_over: self._redraw_end_overlay()
 
     def _edge_rect(self, r, c, d):
         """Rectangle of the gap between a tile and its neighbour in direction d."""
@@ -907,7 +942,7 @@ class App:
     @staticmethod
     def _edge_key(r, c, d):
         """Same key for both sides of an edge, so a wall / door is drawn only once."""
-        return tuple(sorted([(r, c), (r+DELTA[d][0], c+DELTA[d][1])]))
+        return tuple(sorted([(r, c), step(r, c, d)]))
 
     def _seg(self, sp, rect, col):
         x0, y0, x1, y1, horiz = rect
@@ -919,51 +954,30 @@ class App:
         else:
             self.cv.create_rectangle(x0, y0, x1, y1, fill=col, outline="")
 
+    def _draw_edges(self, active, shown, sp, col):
+        """Walls / closed doors (Cell attributes `active` / `shown`): drawn only once discovered
+        (or when the map is revealed), one sprite per edge."""
+        drawn = set()
+        for r, c in CELLS:
+            cell = self.grid[r][c]
+            for d in DIRS:
+                if not getattr(cell, active)[d]: continue
+                if not (getattr(cell, shown)[d] or self.reveal_all): continue
+                key = self._edge_key(r, c, d)
+                if key in drawn: continue
+                drawn.add(key)
+                self._seg(sp, self._edge_rect(r, c, d), col)
+
     def _draw_bases(self):
         """Secret Room tokens (placed by the players before the game, fixed afterwards)."""
-        base_sz = int(TILE * 0.8)
-        for i in (0, 1):
-            cell = self.rooms[i]
+        sz = int(TILE * 0.8)
+        for i, cell in enumerate(self.rooms):
             if cell is None: continue
-            col = C["base_p1"] if i == 0 else C["base_p2"]
-            sp = SP_BASE_P1 if i == 0 else SP_BASE_P2
             cx, cy = self._cx_cy(*cell)
-            ph = SPRITES.get_fit(sp, base_sz, base_sz)
-            if ph:
-                self._img_refs.append(ph)
-                self.cv.create_image(cx, cy, anchor="center", image=ph)
-            else:
-                h = base_sz//2
-                self.cv.create_rectangle(cx-h, cy-h, cx+h, cy+h, fill="", outline=col, width=3)
-                self.cv.create_text(cx, cy, text="⌂", fill=col, font=("Georgia", 16, "bold"))
-
-    def _draw_walls(self):
-        drawn = set()
-        for r in range(ROWS):
-            for c in range(COLS):
-                cell = self.grid[r][c]
-                for d in DIRS:
-                    if not (cell.wall_shown[d] or self.reveal_all): continue
-                    if not cell.walls[d]: continue
-                    key = self._edge_key(r, c, d)
-                    if key in drawn: continue
-                    drawn.add(key)
-                    self._seg(SP_WALL, self._edge_rect(r, c, d), C["wall_col"])
-
-    def _draw_doors(self):
-        """A closed door is drawn only after the warrior bumped into it (or when the map is revealed).
-        One door per edge, drawn exactly where a wall would be."""
-        drawn = set()
-        for r in range(ROWS):
-            for c in range(COLS):
-                cell = self.grid[r][c]
-                for d in DIRS:
-                    if not cell.door_closed[d]: continue
-                    if not (cell.door_shown[d] or self.reveal_all): continue
-                    key = self._edge_key(r, c, d)
-                    if key in drawn: continue
-                    drawn.add(key)
-                    self._seg(SP_DOOR, self._edge_rect(r, c, d), C["door_col"])
+            if not self._blit(SP_BASE[i], cx, cy, sz):
+                h = sz//2
+                self.cv.create_rectangle(cx-h, cy-h, cx+h, cy+h, fill="", outline=P_COL[i], width=3)
+                self.cv.create_text(cx, cy, text="⌂", fill=P_COL[i], font=("Georgia", 16, "bold"))
 
     def _chest_fallback(self, cv, cx, cy, s):
         w = s; h = int(s*0.7)
@@ -971,66 +985,45 @@ class App:
         cv.create_rectangle(cx-w//2, cy-h//2, cx+w//2, cy-h//6, fill=C["treasure_col"], outline="")
         cv.create_rectangle(cx-2, cy-h//6, cx+2, cy+h//10, fill=C["bg"], outline="")
 
+    def _draw_chest(self, cx, cy, s, cv=None):
+        """Treasure sprite (or a vector chest) on the board or on a panel canvas."""
+        cv = self.cv if cv is None else cv
+        if not self._blit(SP_TREAS, cx, cy, s, cv=cv): self._chest_fallback(cv, cx, cy, s)
+
     def _draw_treasure(self):
-        if self.tr < 0: return
-        if not self.reveal_all:
-            hero_on = any(p and p.get("placed") and p.get("alive") and
-                          p["row"] == self.tr and p["col"] == self.tc for p in self.players)
-            if not hero_on: return
-        for p in self.players:
-            if p and p["carrying"]: return
-        sz = int(TILE*0.8)
-        cx, cy = self._cx_cy(self.tr, self.tc)
-        ph = SPRITES.get_fit(SP_TREAS, sz, sz)
-        if ph:
-            self._img_refs.append(ph)
-            self.cv.create_image(cx, cy, anchor="center", image=ph)
-        else:
-            self._chest_fallback(self.cv, cx, cy, sz)
+        if self.tr < 0 or self._carrier(): return
+        if not self.reveal_all and not any((q["row"], q["col"]) == (self.tr, self.tc) for q in self._live()): return
+        self._draw_chest(*self._cx_cy(self.tr, self.tc), int(TILE * 0.8))
 
     def _draw_hints(self):
         """Ring on the active hero and faint outlines on the tiles it can step to."""
         if self.game_over: return
         p = self._cur_player()
-        if p is None or not p["placed"]: return
-        col = C["base_p1"] if self.cur_p == 0 else C["base_p2"]
+        if p is None: return
         r, c = p["row"], p["col"]
-        for dr, dc in DELTA.values():
-            nr, nc = r+dr, c+dc
-            if 0 <= nr < ROWS and 0 <= nc < COLS:
-                x0, y0 = self._xy(nr, nc)
-                self.cv.create_rectangle(x0+3, y0+3, x0+TILE-3, y0+TILE-3, outline=C["label_col"], dash=(3, 4))
+        for _, nr, nc in neighbors(r, c):
+            x0, y0 = self._xy(nr, nc)
+            self.cv.create_rectangle(x0+3, y0+3, x0+TILE-3, y0+TILE-3, outline=C["label_col"], dash=(3, 4))
         x0, y0 = self._xy(r, c)
-        self.cv.create_rectangle(x0-1, y0-1, x0+TILE+1, y0+TILE+1, outline=col, width=2)
+        self.cv.create_rectangle(x0-1, y0-1, x0+TILE+1, y0+TILE+1, outline=P_COL[self.cur_p], width=2)
 
     def _draw_mini_treasure(self, bx, by):
-        bs = int(TILE*0.4); rad = bs//2 + 3
+        bs = int(TILE * 0.4); rad = bs//2 + 3
         self.cv.create_oval(bx-rad, by-rad, bx+rad, by+rad, fill=C["bg"], outline=C["treasure_col"], width=2)
-        ph = SPRITES.get_fit(SP_TREAS, bs, bs)
-        if ph:
-            self._img_refs.append(ph)
-            self.cv.create_image(bx, by, anchor="center", image=ph)
-        else:
-            self._chest_fallback(self.cv, bx, by, bs)
+        self._draw_chest(bx, by, bs)
 
     def _draw_warriors(self):
-        placed = [(i, p) for i, p in enumerate(self.players[:self.num_players])
-                  if p and p["alive"] and p["placed"]]
+        live = [(i, p) for i, p in enumerate(self.players) if p and p["alive"]]
         badges = []
-        for i, p in placed:
+        for i, p in live:
             cx, cy = self._cx_cy(p["row"], p["col"])
-            sharing = [j for j, q in placed if (q["row"], q["col"]) == (p["row"], p["col"])]
+            sharing = [j for j, q in live if (q["row"], q["col"]) == (p["row"], p["col"])]
             if len(sharing) > 1:
                 cx += (-1 if i == sharing[0] else 1) * int(TILE*0.2)
-            sz = int(TILE*(0.68 if len(sharing) > 1 else 0.85))
-            col = C["base_p1"] if i == 0 else C["base_p2"]
-            ph = SPRITES.get_fit(SP_P1 if i == 0 else SP_P2, sz, sz)
-            if ph:
-                self._img_refs.append(ph)
-                self.cv.create_image(cx, cy, anchor="center", image=ph)
-            else:
+            sz = int(TILE * (0.68 if len(sharing) > 1 else 0.85))
+            if not self._blit(SP_HERO[i], cx, cy, sz):
                 h = sz//2 - 2
-                self.cv.create_oval(cx-h, cy-h, cx+h, cy+h, fill=col, outline=C["text_col"], width=2)
+                self.cv.create_oval(cx-h, cy-h, cx+h, cy+h, fill=P_COL[i], outline=C["text_col"], width=2)
                 self.cv.create_text(cx, cy, text=str(i+1), fill="white", font=("Georgia", 13, "bold"))
             if p["carrying"]:      # reduced treasure at the top-right of the warrior
                 badges.append((cx + sz//2 - 5, cy - sz//2 + 5))
@@ -1040,13 +1033,8 @@ class App:
     def _draw_map_ghost(self):
         """The player's own ghost marker."""
         if self._ghost_panel_cell is None: return
-        r, c = self._ghost_panel_cell
-        if not (0 <= r < ROWS and 0 <= c < COLS): return
-        cx, cy = self._cx_cy(r, c); sz = int(TILE*0.75)
-        ph = SPRITES.get_fit(SP_GHOST, sz, sz)
-        if ph:
-            self._img_refs.append(ph)
-            self.cv.create_image(cx, cy, anchor="center", image=ph, tags="map_ghost")
+        cx, cy = self._cx_cy(*self._ghost_panel_cell); sz = int(TILE * 0.75)
+        self._blit(SP_GHOST, cx, cy, sz, tags="map_ghost")
         half = sz//2
         self.cv.create_oval(cx-half, cy-half, cx+half, cy+half,
                             outline=C["highlight"], width=1, dash=(4, 3), tags="map_ghost")
@@ -1060,11 +1048,7 @@ class App:
             mx, my = self._cx_cy(*m)
             self.cv.create_line(mx, my, cx, cy, fill=C["bad"], width=2, dash=(5, 3), arrow="last")
         self.cv.create_oval(cx-half, cy-half, cx+half, cy+half, fill="#1a0a0a", outline="#ff3333", width=3)
-        ph = SPRITES.get_fit(SP_GHOST, sz, sz)
-        if ph:
-            self._img_refs.append(ph)
-            self.cv.create_image(cx, cy, anchor="center", image=ph)
-        else:
+        if not self._blit(SP_GHOST, cx, cy, sz):
             self.cv.create_oval(cx-half+6, cy-half+6, cx+half-6, cy+half-6, fill="#8888cc", outline="")
         self.cv.create_text(cx, cy+half+7, text="Ghost", fill="#ff6655", font=self.F["tiny"])
 
@@ -1128,47 +1112,41 @@ class App:
 
     def _draw_treas_icon(self, cv, show):
         cv.delete("all")
-        if not show: return
-        ph = SPRITES.get_fit(SP_TREAS, 24, 24)
-        if ph:
-            self._panel_img_refs.append(ph)
-            cv.create_image(14, 14, anchor="center", image=ph)
-        else:
-            self._chest_fallback(cv, 14, 14, 22)
+        if show: self._draw_chest(14, 14, 24, cv=cv)
+
+    def _blank_card(self, i, lives, text, dead=False, steps=8):
+        """Player card with no spent steps and no treasure."""
+        ui = self._pui[i]
+        ui["border"].config(bg=C["panel_sep"])
+        self._draw_lives(ui["lives"], lives, 3, dead)
+        self._draw_steps(ui["steps"], 0, steps)
+        self._draw_treas_icon(ui["treas"], False)
+        ui["sv"].set(text)
 
     def _update_panel(self):
         if self.phase != "play":                       # title / setup: nobody is playing yet
-            for i in range(2):
-                ui = self._pui[i]
-                ui["border"].config(bg=C["panel_sep"])
-                self._draw_lives(ui["lives"], 3 if self.phase == "setup" else 0, 3)
-                self._draw_steps(ui["steps"], 0, 8); self._draw_treas_icon(ui["treas"], False)
-                if self.phase == "setup":
-                    ui["sv"].set("Secret Room is on the map" if self.rooms[i] else "Drag its Secret Room onto the map")
-                else:
-                    ui["sv"].set("Waiting to start")
             if self.phase == "setup":
+                for i in range(2):
+                    if self.rooms[i]:                  txt = "Secret Room is on the map"
+                    elif i == 1 and not self.rooms[0]: txt = "Waits for Player 1's Secret Room"
+                    else:                              txt = "Drag its Secret Room onto the map"
+                    self._blank_card(i, 3, txt)
                 self._turn_var.set("Place your Secret Rooms"); self._turn_lbl.config(fg=C["highlight"])
+            else:
+                for i in range(2): self._blank_card(i, 0, "Waiting to start")
             return
         for i in range(2):
             ui = self._pui[i]; p = self.players[i]
-            if p is None:
-                ui["border"].config(bg=C["panel_sep"])
-                self._draw_lives(ui["lives"], 0, 3); self._draw_steps(ui["steps"], 0, 0)
-                self._draw_treas_icon(ui["treas"], False); ui["sv"].set("—"); continue
-            if not p["alive"]:
-                ui["border"].config(bg=C["panel_sep"])
-                self._draw_lives(ui["lives"], 0, 3, dead=True); self._draw_steps(ui["steps"], 0, 0)
-                self._draw_treas_icon(ui["treas"], False); ui["sv"].set("Eliminated"); continue
+            if p is None:        self._blank_card(i, 0, "—", steps=0); continue
+            if not p["alive"]:   self._blank_card(i, 0, "Eliminated", dead=True, steps=0); continue
             active = (i == self.cur_p) and not self.game_over
             ui["border"].config(bg=C["active_border"] if active else C["panel_sep"])
             self._draw_lives(ui["lives"], p["lives"], 3)
             self._draw_steps(ui["steps"], p["used_steps"], p["max_steps"])
             self._draw_treas_icon(ui["treas"], p["carrying"])
             left = max(0, p["max_steps"] - p["used_steps"])
-            if not p["placed"]:  ui["sv"].set("Click a room to hide your Secret Room")
-            elif p["carrying"]:  ui["sv"].set(f"★ Carrying the treasure · {left} moves left")
-            else:                ui["sv"].set(f"{left} of {p['max_steps']} moves left")
+            if p["carrying"]: ui["sv"].set(f"★ Carrying the treasure · {left} moves left")
+            else:             ui["sv"].set(f"{left} of {p['max_steps']} moves left")
         if self.game_over:
             if self.winner is not None:
                 self._turn_var.set(f"🏆  Player {self.winner+1} wins!")
@@ -1176,10 +1154,7 @@ class App:
             else:
                 self._turn_var.set("💀  Game over"); self._turn_lbl.config(fg="#ff3333")
         else:
-            p = self.players[self.cur_p]
-            pc = C["base_p1"] if self.cur_p == 0 else C["base_p2"]
-            txt = f"Player {self.cur_p+1}: hide your room" if (p and not p["placed"]) else f"Player {self.cur_p+1}'s turn"
-            self._turn_var.set(txt); self._turn_lbl.config(fg=pc)
+            self._turn_var.set(f"Player {self.cur_p+1}'s turn"); self._turn_lbl.config(fg=P_COL[self.cur_p])
 
     def _redraw_end_overlay(self):
         """Banner under the board, so the revealed map and the real ghost stay visible."""
@@ -1190,48 +1165,49 @@ class App:
             msg = "💀  Game over"; col = "#ff3333"
         self.cv.create_rectangle(PAD, y0, BOARD_W-PAD, y1, fill=C["end_box"], outline=col, width=2)
         self.cv.create_text(PAD+14, (y0+y1)//2, text=msg, anchor="w", font=self.F["end"], fill=col)
-        self.cv.create_text(BOARD_W-PAD-12, (y0+y1)//2, anchor="e", font=self.F["small"], fill=C["label_col"],
-                            text="Red ring = real ghost  ·  click to play again")
+        self.cv.create_text(BOARD_W-PAD-12, (y0+y1)//2, anchor="e", font=self.F["small"], fill=C["label_col"], text="Red ring = real ghost  ·  click to play again")
 
-    # ═════════════════════════ INPUT ═════════════════════════
+    # ═══ INPUT ═══
     def _bind_keys(self):
-        for key, (dr, dc) in {"Left": (0, -1), "Right": (0, 1), "Up": (-1, 0), "Down": (1, 0),
-                              "a": (0, -1), "d": (0, 1), "w": (-1, 0), "s": (1, 0)}.items():
+        for key, (dr, dc) in {"Left": (0, -1), "Right": (0, 1), "Up": (-1, 0), "Down": (1, 0), "a": (0, -1), "d": (0, 1), "w": (-1, 0), "s": (1, 0)}.items():
             self.root.bind(f"<{key}>", lambda e, dr=dr, dc=dc: self._move(dr, dc))
         self.root.bind("<space>", lambda e: self._end_turn())
         for k in ("v", "V"): self.root.bind(k, lambda e: self._toggle_voice())
         self.cv.bind("<Button-3>", lambda e: self._end_turn())
 
+    def _active_player(self):
+        """The current hero, but only while the game runs and the board accepts input."""
+        if self.phase != "play" or self.game_over or self._locked or self.grid is None: return None
+        return self._cur_player()
+
     def _move(self, dr, dc):
-        if self.phase != "play" or self.game_over or self._locked: return
-        p = self._cur_player()
-        if p is None: return
-        nr, nc = p["row"]+dr, p["col"]+dc
-        if 0 <= nr < ROWS and 0 <= nc < COLS: self._take_turn(nr, nc)
+        p = self._active_player()
+        if p and in_grid(p["row"]+dr, p["col"]+dc): self._take_turn(p["row"]+dr, p["col"]+dc)
 
     def _end_turn(self):
         """During setup this button is 'Start game'; during play it ends the turn."""
         if self.phase == "setup": self._start_game(); return
-        if self.phase != "play" or self.game_over or self._locked: return
-        p = self._cur_player()
-        if p is None: return
-        self._say(CAPTIONS["endturn"])
-        self._finish_turn(p)
+        p = self._active_player()
+        if p: self._say(CAPTIONS["endturn"]); self._finish_turn(p)
 
     def _toggle_voice(self):
-        self.voice = "nat" if self.voice == "sayit" else "sayit"
+        self.voice = "Natural" if self.voice == "Robo" else "Robo"
         self.snd.voice = self.voice
         self._btn_voice.set_text(f"♪  Voice: {self.voice}")
 
-    # ═════════════════════════ GAME LOGIC ═════════════════════════
+    # ═══ GAME LOGIC ═══
     def _cur_player(self):
         p = self.players[self.cur_p]
         return p if (p and p["alive"]) else None
 
+    def _live(self): return [q for q in self.players if q and q["alive"]]
+    def _carrier(self): return next((q for q in self._live() if q["carrying"]), None)
     def _in_own_base(self, p): return p["row"] == p["base_r"] and p["col"] == p["base_c"]
     def _idx(self, p): return next(i for i, q in enumerate(self.players) if q is p)
 
-
+    def _warriors_at(self, row, col):
+        """Warriors standing on (row, col) outside their own Secret Room (the ghost can reach them)."""
+        return [q for q in self._live() if (q["row"], q["col"]) == (row, col) and not self._in_own_base(q)]
 
     def _spend_strength(self, p):
         """Every move costs a little strength; now and then the computer renews it. Never shown."""
@@ -1248,28 +1224,28 @@ class App:
         if a["strength"] == b["strength"]: return random.choice(victims)
         return a if a["strength"] < b["strength"] else b
 
-    def _warriors_at(self, row, col):
-        return [q for q in self.players[:self.num_players]
-                if q and q["alive"] and q["placed"] and (q["row"], q["col"]) == (row, col)
-                and not self._in_own_base(q)]
+    def _try_wake_ghost(self, p):
+        """Every step inside the wake zone is a roll: 25% at distance 3, 50% at 2, 100% at 1.
+        A hero inside his own Secret Room can't be sensed."""
+        if self.dragon_awake or self._in_own_base(p): return
+        d = manhattan(p["row"], p["col"], self.dr, self.dc)
+        if d <= DRAGON_WAKE_DIST and random.random() < WAKE_CHANCE[max(d, 1)]:
+            self.dragon_awake = True
+            self.ghost_fresh = True            # it stirs now, but only moves from its next turn
+            self.snd.push("ghostawakes")
 
     def _take_turn(self, row, col):
-        if self._locked or self.game_over or self.grid is None: return
-        p = self._cur_player()
+        p = self._active_player()
         if p is None: return
         dr = row - p["row"]; dc = col - p["col"]
         if abs(dr) + abs(dc) != 1:
             self.snd.push("no"); return
         d = "n" if dr == -1 else "s" if dr == 1 else "w" if dc == -1 else "e"
         cell = self.grid[p["row"]][p["col"]]
-        p["moved"] = True
 
         if not cell.passable(d):
             is_door = cell.door_closed[d]
-            if is_door:
-                self._mark_door(p["row"], p["col"], d)
-            else:
-                self._mark_wall(p["row"], p["col"], d)
+            self._mark_edge(p["row"], p["col"], d, is_door)
             self._flash_wall(p["row"], p["col"], d, is_door)
             self.snd.push("hitawall")                     # same "ouch" for walls and doors
             if is_door:
@@ -1282,11 +1258,7 @@ class App:
         self._spend_strength(p)
         self.grid[row][col].seen = True; self._reveal_adjacent(row, col)
         self.snd.push("tik")
-
-        # the ghost wakes up when a hero gets close to the Treasure Room
-        if not self.dragon_awake and manhattan(row, col, self.tr, self.tc) <= DRAGON_WAKE_DIST:
-            self.dragon_awake = True
-            self.snd.push("ghostawakes")
+        self._try_wake_ghost(p)
 
         # stepping on the awake ghost: it attacks (the weaker one, if both warriors are here)
         if self.dragon_awake and (row, col) == (self.dr, self.dc):
@@ -1301,7 +1273,7 @@ class App:
                 self._dragon_attacks(v, after); return
 
         # treasure: it is heavy, picking it up STOPS the warrior; afterwards 4 moves per turn
-        if (row, col) == (self.tr, self.tc) and not any(q and q["carrying"] for q in self.players):
+        if (row, col) == (self.tr, self.tc) and not self._carrier():
             p["carrying"] = True; p["max_steps"] = TREASURE_STEPS
             p["used_steps"] = max(p["used_steps"], p["max_steps"])
             self.snd.push("foundtreasure")
@@ -1347,6 +1319,8 @@ class App:
     def _do_dragon_turn(self, p):
         """Move the ghost one step. Returns True if it attacked somebody."""
         if not self.dragon_awake or self.game_over: return False
+        if self.ghost_fresh:                        # it has just woken up: it moves from its next turn
+            self.ghost_fresh = False; return False
         if self._ghost_hold is not None:            # the ghost waits beside the warrior it did not wound
             hw, skips = self._ghost_hold
             if hw is not p or not hw["alive"]:
@@ -1355,25 +1329,15 @@ class App:
             if skips > 0:
                 self._ghost_hold[1] -= 1; return False
             self._ghost_hold = None
-        carrier = next((pl for pl in self.players if pl and pl["alive"] and pl["carrying"]), None)
-        if carrier:
-            tr, tc = carrier["row"], carrier["col"]
-        else:
-            active = [pl for pl in self.players if pl and pl["alive"] and pl["placed"]]
-            out = [pl for pl in active if not self._in_own_base(pl)]
-            if not out:
-                tr, tc = self.tr, self.tc
-            else:
-                out.sort(key=lambda pl: manhattan(self.dr, self.dc, pl["row"], pl["col"]))
-                tr, tc = out[0]["row"], out[0]["col"]
-
+        out = [q for q in self._live() if not self._in_own_base(q)]
+        goal = self._carrier() or min(out, key=lambda q: manhattan(self.dr, self.dc, q["row"], q["col"]), default=None)
+        tr, tc = (goal["row"], goal["col"]) if goal else (self.tr, self.tc)
         if (self.dr, self.dc) != (tr, tc):
-            self.dr = max(0, min(ROWS-1, self.dr + (1 if self.dr < tr else (-1 if self.dr > tr else 0))))
-            self.dc = max(0, min(COLS-1, self.dc + (1 if self.dc < tc else (-1 if self.dc > tc else 0))))
+            self.dr += (tr > self.dr) - (tr < self.dr)
+            self.dc += (tc > self.dc) - (tc < self.dc)
             self.snd.push("ghostmoves")
 
-        victims = [q for q in self.players if q and q["alive"] and q["placed"]
-                   and (q["row"], q["col"]) == (self.dr, self.dc) and not self._in_own_base(q)]
+        victims = self._warriors_at(self.dr, self.dc)
         if not victims: return False
         v = self._pick_victim(victims)
         others = [q for q in victims if q is not v]
@@ -1387,7 +1351,7 @@ class App:
         self._locked = True
         self.dr, self.dc = v["row"], v["col"]
         lethal = v["carrying"] or v["lives"] <= 1
-        last = lethal and not any(q and q["alive"] and q is not v for q in self.players[:self.num_players])
+        last = lethal and not any(q is not v for q in self._live())
         if not last:        # on the LAST hero's death the marker is not placed: the player's guess stays his own
             self._ghost_panel_cell = (v["row"], v["col"])
         self.snd.push("ghostattacks")
@@ -1408,7 +1372,7 @@ class App:
             v["row"] = v["base_r"]; v["col"] = v["base_c"]
         if v["lives"] <= 0:
             v["alive"] = False
-            survivors = [i for i in range(self.num_players) if self.players[i] and self.players[i]["alive"]]
+            survivors = [i for i, q in enumerate(self.players) if q and q["alive"]]
             self.snd.push("gameover")
             if survivors:                       # the other warrior carries on
                 self._say(f"Player {n} is out of the game. Player {survivors[0]+1} carries on.", "bad")
@@ -1428,8 +1392,7 @@ class App:
         holds the treasure. The computer decides using each warrior's hidden strength."""
         if self.num_players < 2: return
         o = self.players[1 - self._idx(p)]
-        if not o or not o["alive"] or not o["placed"]: return
-        if (o["row"], o["col"]) != (p["row"], p["col"]): return
+        if not o or not o["alive"] or (o["row"], o["col"]) != (p["row"], p["col"]): return
         if not (p["carrying"] or o["carrying"]): return
 
         sp, so = p["strength"], o["strength"]       # hidden strength, unrelated to moves per turn
@@ -1449,9 +1412,8 @@ class App:
         # the turn continues or ends by the usual rule: used_steps >= max_steps ends it
 
     def _check_win(self):
-        for i in range(self.num_players):
-            q = self.players[i]
-            if q and q["alive"] and q["placed"] and q["carrying"] and self._in_own_base(q):
+        for i, q in enumerate(self.players):
+            if q and q["alive"] and q["carrying"] and self._in_own_base(q):
                 self._win(i); return True
         return False
 
@@ -1462,24 +1424,16 @@ class App:
         self._btn_end.set_enabled(False)
         self._update_panel(); self._full_redraw()
 
-
-    def _reveal_adjacent(self,r,c):
-        self.grid[r][c].seen=True
-        for d,(dr,dc) in DELTA.items():
-            nr,nc=r+dr,c+dc
-            if 0<=nr<ROWS and 0<=nc<COLS and not self.grid[r][c].walls[d]:
-                self.grid[nr][nc].seen=True
-
-    def _mark_wall(self,r,c,d,*,is_door=False):
-        self.grid[r][c].wall_shown[d]=True; self.grid[r][c].seen=True
-        nr,nc=r+DELTA[d][0],c+DELTA[d][1]
-        if 0<=nr<ROWS and 0<=nc<COLS: self.grid[nr][nc].wall_shown[OPP[d]]=True
+    def _reveal_adjacent(self, r, c):
+        self.grid[r][c].seen = True
+        for d, nr, nc in neighbors(r, c):
+            if not self.grid[r][c].walls[d]: self.grid[nr][nc].seen = True
 
     def _next_player(self):
-        if self.num_players==1: return
+        if self.num_players == 1: return
         for _ in range(self.num_players):
-            self.cur_p=(self.cur_p+1)%self.num_players
-            p=self.players[self.cur_p]
+            self.cur_p = (self.cur_p + 1) % self.num_players
+            p = self.players[self.cur_p]
             if p and p["alive"]: break
 
 
