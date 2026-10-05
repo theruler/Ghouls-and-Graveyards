@@ -1,5 +1,0 @@
-YOUR GOAL:
---- RECORDSEPARATOR ---
-Find the treasure and return it to your home base 
---- RECORDSEPARATOR ---
-while avoiding the ghost!
