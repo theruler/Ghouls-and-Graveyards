@@ -1,4 +1,5 @@
 import os, sys, math, random, threading, tempfile, wave, struct, time
+from array import array
 import tkinter as tk
 from tkinter import font as tkfont
 from PIL import Image, ImageTk, ImageOps
@@ -37,8 +38,8 @@ DRAGON_WAKE_DIST = 3          # a hero can wake the ghost from this distance
 WAKE_CHANCE      = {3: 0.25, 2: 0.50, 1: 1.0}   # chance to wake per hero step, by distance from the ghost
 STEPS_BY_LIVES   = {3: 8, 2: 6, 1: 4, 0: 0}
 TREASURE_STEPS   = 4          # moves per turn while carrying the treasure
-PHANTOM_DOORS    = 4          # max closed doors at the same time
-DOOR_TURNS       = (3, 9)     # a door stays closed for a random number of turns
+DOOR_COUNT       = 8          # magic doors on the map (level 2): fixed positions, they open and close at random
+DOOR_TURNS       = (3, 9)     # a door keeps its state for a random number of hero actions (moves / bumps), then flips
 START_STRENGTH   = 50         # both warriors start equally strong
 STRENGTH_LOSS    = (1, 3)     # lost at every move
 RENEW_MOVES      = (12, 30)   # strength is renewed after a random number of moves
@@ -165,40 +166,89 @@ def _warrior_tune_path(idx):
 
 
 def _build_audio_backend():
-    """play(list_of_paths) plays the files one after the other; a new call interrupts the old one."""
+    """play(list_of_paths) plays the files one after the other; a new call interrupts the old one.
+    Preferred engine: one persistent output device owned by a dedicated thread, sounds decoded in
+    memory (starts within a few ms).  If it can't start, falls back to one device per sound."""
     try:
         import miniaudio
-    except Exception:
+    except Exception as e:
+        print("[audio] miniaudio not available:", e, file=sys.stderr)
         return (lambda paths: None), (lambda: False)
-    state = {"gen": 0, "thread": None}
 
-    def play(paths):
+    import traceback
+    RATE, CH = 44100, 2
+    lock = threading.Lock()
+    state = {"q": [], "pos": 0, "prio": False}
+    cache = {}
+    ready = threading.Event(); ok = {"v": False}
+    gap = array("h", [0]) * int(RATE * CH * 0.12)
+
+    def load(path):
+        s = cache.get(path)
+        if s is None:
+            try:
+                dec = miniaudio.decode_file(path, output_format=miniaudio.SampleFormat.SIGNED16,
+                                            nchannels=CH, sample_rate=RATE)
+                s = array("h"); s.frombytes(bytes(dec.samples) if not isinstance(dec.samples, array) else dec.samples.tobytes())
+                cache[path] = s
+            except Exception:
+                print("[audio] cannot decode", path, file=sys.stderr); traceback.print_exc()
+                return array("h")
+        return s
+
+    def stream():
+        required = yield b""
+        while True:
+            n = required * CH
+            out = array("h")
+            try:
+                with lock:
+                    q = state["q"]
+                    while len(out) < n and q:
+                        cur = q[0]; pos = state["pos"]
+                        chunk = cur[pos:pos + n - len(out)]
+                        out.extend(chunk); pos += len(chunk)
+                        if pos >= len(cur): q.pop(0); state["pos"] = 0
+                        else: state["pos"] = pos
+            except Exception:
+                traceback.print_exc()
+            if len(out) < n: out.extend(array("h", [0]) * (n - len(out)))
+            required = yield out
+
+    def engine():
+        try:
+            dev = miniaudio.PlaybackDevice(output_format=miniaudio.SampleFormat.SIGNED16,
+                                           nchannels=CH, sample_rate=RATE, buffersize_msec=40)
+            gen = stream(); next(gen); dev.start(gen)
+            ok["v"] = True; ready.set()
+            for files in SND_FILES.values():
+                for f in files: load(os.path.join(SOUND_DIR, f))
+            while True: time.sleep(3600)
+        except Exception:
+            print("[audio] audio device failed", file=sys.stderr); traceback.print_exc()
+            ready.set()
+
+    threading.Thread(target=engine, daemon=True).start()
+    ready.wait(3)
+
+    if not ok["v"]:
+        return (lambda paths, priority=False: None), (lambda: False)
+
+    def play(paths, priority=False):
+        """priority=True (ghost sounds) cuts whatever is playing; any other sound is dropped
+        while a priority sound is still playing."""
         if isinstance(paths, str): paths = [paths]
         paths = [p for p in paths if p and os.path.exists(p)]
-        state["gen"] += 1
-        gen = state["gen"]
-        if not paths: return
-
-        def run():
-            for path in paths:
-                if state["gen"] != gen: return
-                try:
-                    stream = miniaudio.stream_file(path)
-                    with miniaudio.PlaybackDevice() as dev:
-                        dev.start(stream)
-                        while dev.callback_generator is not None:
-                            if state["gen"] != gen: return
-                            time.sleep(0.02)
-                        time.sleep(0.12)
-                except Exception:
-                    pass
-        t = threading.Thread(target=run, daemon=True)
-        state["thread"] = t
-        t.start()
+        parts = []
+        for i, p in enumerate(paths):
+            if i: parts.append(gap)
+            parts.append(load(p))
+        with lock:
+            if paths and not priority and state["prio"] and state["q"]: return
+            state["q"] = parts; state["pos"] = 0; state["prio"] = bool(priority and parts)
 
     def busy():
-        t = state["thread"]
-        return bool(t and t.is_alive())
+        with lock: return bool(state["q"])
     return play, busy
 
 _audio_play, _audio_busy = _build_audio_backend()
@@ -209,6 +259,7 @@ class SoundQueue:
     def __init__(self, root, voice="Robo"):
         self.root = root; self.voice = voice
         self.on_caption = lambda s: None
+        self.GHOST_KEYS = ("ghostawakes", "ghostattacks", "ghostmoves")
 
     def _path(self, key):
         files = SND_FILES.get(key, [])
@@ -219,14 +270,14 @@ class SoundQueue:
     def push(self, key):
         cap = CAPTIONS.get(key, "")
         if cap: self.on_caption(cap)
-        _audio_play([self._path(key)])
+        _audio_play([self._path(key)], priority=key in self.GHOST_KEYS)
 
     def push_duel(self, winner_idx, caption):
         """Winner's tune followed by the treasure tune."""
         self.on_caption(caption)
         _audio_play([_warrior_tune_path(winner_idx), self._path("foundtreasure")])
 
-    def clear(self): _audio_play([])
+    def clear(self): _audio_play([], priority=True)
     def busy(self): return _audio_busy()
 
 
@@ -850,10 +901,11 @@ class App:
         n = len(placed)
         treasure = random.choice(far_cells([(rm, MIN_TREAS_DIST) for rm in placed]))
         self.tr, self.tc = treasure
-        self.dr, self.dc = self._pick_ghost_spot(placed, treasure)
+        self.dr, self.dc = treasure                      # the ghost sleeps on the treasure tile
         self.grid = generate_maze(treasure, placed)      # every room has 2 different routes to the treasure
         self.dragon_awake = False; self.ghost_fresh = False
         self.num_players = n
+        self._place_doors()
         self.players = [self._new_player(rm) for rm in placed] + [None] * (2 - n)
         for p in self.players[:n]: self._reveal_adjacent(p["row"], p["col"])
         self.cur_p = 0; self.phase = "play"
@@ -867,23 +919,34 @@ class App:
     def _treasure_ok(self):
         return treasure_ok(self.grid, (self.tr, self.tc), [rm for rm in self.rooms if rm])
 
-    def _pick_door(self):
-        """A random open edge that can close without leaving a Secret Room with fewer than 2 routes."""
+    def _place_doors(self):
+        """Level 2: pick the fixed positions of the magic doors (on passages, never on walls), then give each
+        a random starting state."""
+        self.doors = []
+        if self.difficulty != 2 or self.grid is None: return
         cands = [(r, c, d) for r, c in CELLS for d in ("n", "e")
-                 if in_grid(*step(r, c, d)) and not self.grid[r][c].walls[d] and not self.grid[r][c].is_door[d]]
+                 if in_grid(*step(r, c, d)) and not self.grid[r][c].walls[d]]
         random.shuffle(cands)
-        for spot in cands:
-            self._set_door(*spot, True)
-            if self._treasure_ok(): return spot
-            self._set_door(*spot, False)
-        return None
+        for r, c, d in cands:
+            if len(self.doors) >= DOOR_COUNT: break
+            if not self._try_close(r, c, d): continue          # a door must be able to close without trapping anybody
+            self._set_closed(r, c, d, False)
+            nr, nc = step(r, c, d)
+            self.grid[r][c].is_door[d] = True; self.grid[nr][nc].is_door[OPP[d]] = True
+            self.doors.append([r, c, d, random.randint(*DOOR_TURNS)])
+        for r, c, d, _t in self.doors:
+            if random.random() < 0.5: self._try_close(r, c, d)
 
-    def _set_door(self, r, c, d, on):
+    def _set_closed(self, r, c, d, closed):
         nr, nc = step(r, c, d)
-        for a, b, dd in ((r, c, d), (nr, nc, OPP[d])):
-            cell = self.grid[a][b]
-            cell.is_door[dd] = on; cell.door_closed[dd] = on
-            if not on: cell.door_shown[dd] = False      # an open door is invisible again
+        self.grid[r][c].door_closed[d] = closed
+        self.grid[nr][nc].door_closed[OPP[d]] = closed
+
+    def _try_close(self, r, c, d):
+        """Close a door unless that would leave a Secret Room with fewer than 2 routes to the treasure."""
+        self._set_closed(r, c, d, True)
+        if self._treasure_ok(): return True
+        self._set_closed(r, c, d, False); return False
 
     def _mark_edge(self, r, c, d, door):
         """Remember a wall (or door) the warrior bumped into, on both sides of the edge."""
@@ -894,18 +957,16 @@ class App:
         if in_grid(nr, nc): getattr(self.grid[nr][nc], attr)[OPP[d]] = True
 
     def _update_doors(self):
-        """Once per turn the computer decides which doors reopen and which new ones close, silently."""
+        """Called after every hero action (a step or a bump, never an idle End turn): every door whose
+        timer ran out flips at random, open <-> closed, forever. Discovered doors stay on the map."""
         if self.difficulty != 2 or self.grid is None: return
-        for dr in list(self.doors):
+        for dr in self.doors:
             dr[3] -= 1
-            if dr[3] <= 0:
-                self._set_door(dr[0], dr[1], dr[2], False); self.doors.remove(dr)
-        for _ in range(2):
-            if len(self.doors) < PHANTOM_DOORS and random.random() < 0.5:
-                spot = self._pick_door()
-                if spot:
-                    self._set_door(*spot, True)
-                    self.doors.append([spot[0], spot[1], spot[2], random.randint(*DOOR_TURNS)])
+            if dr[3] > 0: continue
+            r, c, d = dr[0], dr[1], dr[2]
+            if self.grid[r][c].door_closed[d]: self._set_closed(r, c, d, False)
+            else: self._try_close(r, c, d)
+            dr[3] = random.randint(*DOOR_TURNS)
 
     # ═══ DRAWING ═══
     def _blit(self, sp, x, y, w, h=None, cv=None, anchor="center", **kw):
@@ -926,7 +987,7 @@ class App:
         self._draw_bases()
         if self.grid is not None:
             self._draw_edges("walls", "wall_shown", SP_WALL, C["wall_col"])
-            self._draw_edges("door_closed", "door_shown", SP_DOOR, C["door_col"])
+            self._draw_edges("is_door", "door_shown", SP_DOOR, C["door_col"])
         self._draw_treasure(); self._draw_hints(); self._draw_warriors()
         self._draw_map_ghost(); self._draw_real_ghost(); self._draw_flashes()
         if self.game_over: self._redraw_end_overlay()
@@ -1252,10 +1313,14 @@ class App:
                 self._say("A closed door! You stay where you are and your turn is over. "
                           "Try again later: every door opens sooner or later.", "bad")
             p["used_steps"] = p["max_steps"]
+            self._update_doors()
             self._finish_turn(p); return
 
+        if cell.is_door[d]:                               # crossing an open door: now you know it is there
+            self._mark_edge(p["row"], p["col"], d, True)
         p["row"] = row; p["col"] = col; p["used_steps"] += 1
         self._spend_strength(p)
+        self._update_doors()
         self.grid[row][col].seen = True; self._reveal_adjacent(row, col)
         self.snd.push("tik")
         self._try_wake_ghost(p)
@@ -1267,7 +1332,7 @@ class App:
                 v = self._pick_victim(here)
                 others = [q for q in here if q is not v]
                 if others:                                # the survivor shares the square with the ghost
-                    self._ghost_hold = [others[0], 1 if others[0] is p else 0]
+                    self._ghost_hold = [others[0], 1 if self._idx(others[0]) <= self._idx(p) else 0]
                 after = (lambda: self._finish_turn(p)) if v is p else (lambda: self._resume_turn(p))
                 self._update_panel(); self._full_redraw()
                 self._dragon_attacks(v, after); return
@@ -1296,22 +1361,33 @@ class App:
         """End of a warrior's turn: the ghost moves (and may attack), then the next player starts."""
         if self.game_over: return
         self._update_panel(); self._full_redraw()
-        if self.dragon_awake and self.snd.busy():   # let the "ouch" / door sound finish before the ghost flies
+        if self.dragon_awake and self._round_end(p) and self.snd.busy():   # let the "ouch" / door sound finish before the ghost flies
             self._locked = True
-            self._attack_job = self.root.after(900, lambda: self._finish_turn_now(p))
+            self._attack_job = self.root.after(20, lambda: self._wait_sound(p, 0))
             return
+        self._finish_turn_now(p)
+
+    def _wait_sound(self, p, n):
+        if self.game_over: return
+        if self.snd.busy() and n < 75:
+            self._attack_job = self.root.after(20, lambda: self._wait_sound(p, n + 1)); return
         self._finish_turn_now(p)
 
     def _finish_turn_now(self, p):
         self._locked = False; self._attack_job = None
         if self.game_over: return
-        if self._do_dragon_turn(p): return          # an attack is in progress; it resumes the flow
+        if self._round_end(p) and self._do_dragon_turn(p): return   # an attack is in progress; it resumes the flow
         self._advance_turn(p)
+
+    def _round_end(self, p):
+        """Order of play: Player 1, Player 2, ghost, Player 1 ... The ghost moves once per round, right
+        after the last warrior still in the game has finished his turn."""
+        i = self._idx(p)
+        return not any(q and q["alive"] for q in self.players[i + 1:])
 
     def _advance_turn(self, p):
         if self.game_over: return
         p["used_steps"] = 0
-        self._update_doors()
         self._next_player()
         self._update_panel(); self._full_redraw()
 
@@ -1323,13 +1399,16 @@ class App:
             self.ghost_fresh = False; return False
         if self._ghost_hold is not None:            # the ghost waits beside the warrior it did not wound
             hw, skips = self._ghost_hold
-            if hw is not p or not hw["alive"]:
-                if not hw["alive"]: self._ghost_hold = None
-                return False
-            if skips > 0:
+            if hw["alive"] and skips > 0:
                 self._ghost_hold[1] -= 1; return False
             self._ghost_hold = None
         out = [q for q in self._live() if not self._in_own_base(q)]
+        if not out:                                 # all heroes are home (unseen): the ghost returns to the treasure, still awake
+            self._ghost_hold = None
+            if (self.dr, self.dc) != (self.tr, self.tc):
+                self.dr, self.dc = self.tr, self.tc
+                self.snd.push("ghostmoves")
+            return False
         goal = self._carrier() or min(out, key=lambda q: manhattan(self.dr, self.dc, q["row"], q["col"]), default=None)
         tr, tc = (goal["row"], goal["col"]) if goal else (self.tr, self.tc)
         if (self.dr, self.dc) != (tr, tc):
