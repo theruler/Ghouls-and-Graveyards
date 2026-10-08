@@ -73,6 +73,7 @@ START_STRENGTH   = 50         # both warriors start equally strong
 STRENGTH_LOSS    = (1, 3)     # lost at every move
 RENEW_MOVES      = (12, 30)   # strength is renewed after a random number of moves
 ATTACK_DELAY_MS  = 600
+DOOR_OUCH_PITCH  = 0.88       # closed-door "ouch" pitch multiplier
 
 DELTA = {"n": (-1,0), "s": (1,0), "e": (0,1), "w": (0,-1)}
 OPP   = {"n":"s", "s":"n", "e":"w", "w":"e"}
@@ -150,7 +151,7 @@ TIPS = {
     "end":   "End your turn now (Space, or right-click on the map).",
     "l1":    "New Level 1 game: a new random dungeon every game, built like the original (ROM) one.",
     "walls": "Wall mode. Auto: bumped walls are drawn for you. Manual: nothing is drawn; click the gap between two tiles "
-             "to place a wall marker yourself (click it again to remove it). Can only be changed between games.",
+             "to place a wall marker yourself (click again: a door marker on Level 2; once more to remove it). Can only be changed between games.",
     "l2":    "New Level 2 game: magic doors close and reopen at random as the turns go by. "
              "You only find one by bumping into it.",
     "voice": "Switch the announcer between the synthesised and the natural voice.",
@@ -207,7 +208,7 @@ def _build_audio_backend():
     miniaudio = _ensure("miniaudio")
     if miniaudio is None:
         print("[audio] miniaudio not available", file=sys.stderr)
-        return (lambda paths: None), (lambda: False)
+        return (lambda paths, priority=False, append=False, pitch=1.0: None), (lambda: False)
 
     import traceback
     RATE, CH = 44100, 2
@@ -217,14 +218,18 @@ def _build_audio_backend():
     ready = threading.Event(); ok = {"v": False}
     gap = array("h", [0]) * int(RATE * CH * 0.12)
 
-    def load(path):
-        s = cache.get(path)
+    def load(path, pitch=1.0):
+        # To lower pitch without changing the playback device, decode the sound at a higher
+        # sample rate and feed those samples to the fixed RATE output.
+        decode_rate = RATE if pitch == 1.0 else max(RATE, int(round(RATE / pitch)))
+        key = (path, decode_rate)
+        s = cache.get(key)
         if s is None:
             try:
                 dec = miniaudio.decode_file(path, output_format=miniaudio.SampleFormat.SIGNED16,
-                                            nchannels=CH, sample_rate=RATE)
+                                            nchannels=CH, sample_rate=decode_rate)
                 s = array("h"); s.frombytes(bytes(dec.samples) if not isinstance(dec.samples, array) else dec.samples.tobytes())
-                cache[path] = s
+                cache[key] = s
             except Exception:
                 print("[audio] cannot decode", path, file=sys.stderr); traceback.print_exc()
                 return array("h")
@@ -266,18 +271,21 @@ def _build_audio_backend():
     ready.wait(3)
 
     if not ok["v"]:
-        return (lambda paths, priority=False: None), (lambda: False)
+        return (lambda paths, priority=False, append=False, pitch=1.0: None), (lambda: False)
 
-    def play(paths, priority=False):
+    def play(paths, priority=False, append=False, pitch=1.0):
         """priority=True (ghost sounds) cuts whatever is playing; any other sound is dropped
-        while a priority sound is still playing."""
+        while a priority sound is still playing. append=True never cuts anything: the sound is queued after
+        what is playing now (if nothing is playing it starts at once) and is protected like a priority one."""
         if isinstance(paths, str): paths = [paths]
         paths = [p for p in paths if p and os.path.exists(p)]
         parts = []
         for i, p in enumerate(paths):
             if i: parts.append(gap)
-            parts.append(load(p))
+            parts.append(load(p, pitch=pitch))
         with lock:
+            if append and parts and state["q"]:
+                state["q"].extend([gap] + parts); state["prio"] = True; return
             if paths and not priority and state["prio"] and state["q"]: return
             state["q"] = parts; state["pos"] = 0; state["prio"] = bool(priority and parts)
 
@@ -301,10 +309,12 @@ class SoundQueue:
         idx = 0 if self.voice == "Robo" else 1
         return os.path.join(SOUND_DIR, files[idx] if idx < len(files) else files[0])
 
-    def push(self, key):
+    def push(self, key, pitch=1.0):
         cap = CAPTIONS.get(key, "")
         if cap: self.on_caption(cap)
-        _audio_play([self._path(key)], priority=key in self.GHOST_KEYS)
+        if key == "gameover":      # must not be dropped by (or cut) the "ghost attacks" sound: play it right after it
+            _audio_play([self._path(key)], priority=True, append=True, pitch=pitch); return
+        _audio_play([self._path(key)], priority=key in self.GHOST_KEYS, pitch=pitch)
 
     def push_duel(self, winner_idx, caption):
         """Winner's tune followed by the treasure tune."""
@@ -623,7 +633,7 @@ def generate_rom_level(rooms, tries=400):
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Ghouls & Graveyards")
+        self.root.title("Ghouls & Graveyards v1.3 by Theruler76")
         self.root.configure(bg=C["bg"])
         self.root.resizable(False, False)
         self._fonts()
@@ -638,7 +648,7 @@ class App:
         self.tr = self.tc = -1
         self.game_over = False; self.winner = None
         self.reveal_all = False; self.doors = []
-        self.manual_walls = False; self.user_walls = set()   # manual wall mode: markers placed by the players
+        self.manual_walls = False; self.user_walls = {}   # manual wall mode: markers placed by the players, (r, c, d) -> "wall" | "door"
         self._attack_job = None
         self._locked = False                    # input locked while the ghost attacks
         self._ghost_panel_cell = None           # the player's own ghost MARKER
@@ -694,7 +704,7 @@ class App:
     def _build_panel(self, p):
         cb = C["card_bg"]
         # footer: packed first with side="bottom" so it stays anchored at the bottom of the panel
-        tk.Label(p, text="Arrows / WASD or click a neighbouring tile", font=self.F["tiny"], bg=C["panel_bg"], fg=C["dim_col"]).pack(side="bottom", pady=(0, 6))
+        tk.Label(p, text="Move by using the arrows, WASD or by clicking an adjacent tile.", font=self.F["tiny"], bg=C["panel_bg"], fg=C["text_col"]).pack(side="bottom", pady=(0, 6))
         # whose turn
         self._turn_var = tk.StringVar(value="")
         self._turn_lbl = tk.Label(p, textvariable=self._turn_var, font=self.F["turn"], bg=cb, fg=C["highlight"], pady=9)
@@ -986,7 +996,7 @@ class App:
         self.difficulty = level; self.phase = "setup"
         self.game_over = False; self.winner = None; self.reveal_all = False
         self.doors = []; self._locked = False; self._ghost_hold = None
-        self.user_walls = set()
+        self.user_walls = {}
         self.dragon_awake = False; self.ghost_fresh = False
         self.grid = None; self.players = [None, None]; self.num_players = 0; self.cur_p = 0
         self.tr = self.tc = self.dr = self.dc = -1
@@ -1043,9 +1053,9 @@ class App:
             self._say("Wall mode can only be changed between games.", "bad"); return
         self.manual_walls = not self.manual_walls
         self._btn_walls.set_text("Walls: Manual" if self.manual_walls else "Walls: Auto")
-        self.user_walls = set()
-        self._say("Manual walls: bumped walls are not drawn. Click the gap between two tiles to place or remove a wall marker."
-                  if self.manual_walls else "Auto walls: bumped walls are drawn for you.")
+        self.user_walls = {}
+        self._say("Manual walls: bumped walls/doors are not placed. Click the gap between two tiles to place a marker or remove it."
+                  if self.manual_walls else "Auto walls: bumped walls/doors are automatically placed.")
         if self.grid is not None: self._full_redraw()
 
     def _edge_from_canvas(self, x, y):
@@ -1065,16 +1075,24 @@ class App:
         return (rr, c, "s") if 0 <= rr < ROWS - 1 else None
 
     def _toggle_user_wall(self, r, c, d):
+        """Click cycle: empty -> wall -> door (level 2 only) -> empty."""
         key = (r, c, d)
-        if key in self.user_walls: self.user_walls.discard(key)
-        else: self.user_walls.add(key)
+        cur = self.user_walls.get(key)
+        if cur is None: self.user_walls[key] = "wall"
+        elif cur == "wall" and self.difficulty == 2: self.user_walls[key] = "door"
+        else: del self.user_walls[key]
         self._full_redraw()
 
     def _draw_user_walls(self):
-        for r, c, d in self.user_walls:
+        for (r, c, d), kind in self.user_walls.items():
             rect = self._edge_rect(r, c, d)
-            if self.reveal_all and self.grid[r][c].walls[d] is False:      # game over: a marker where there was no wall
-                self.cv.create_rectangle(*rect[:4], fill="#cc2222", outline="")
+            if kind == "door":
+                if self.reveal_all and not self.grid[r][c].is_door[d]:     # game over: a door marker where there is no door
+                    self.cv.create_rectangle(*rect[:4], fill="#CCAA00", outline="")
+                else:
+                    self._seg(SP_DOOR, rect, C["door_col"])
+            elif self.reveal_all and self.grid[r][c].walls[d] is False:    # game over: a marker where there was no wall
+                self.cv.create_rectangle(*rect[:4], fill="#CCFF00", outline="")
             else:
                 self._seg(SP_WALL, rect, C["wall_col"])
 
@@ -1113,8 +1131,9 @@ class App:
 
     def _mark_edge(self, r, c, d, door):
         """Remember a wall (or door) the warrior bumped into, on both sides of the edge."""
+        if self.manual_walls:
+            return                                      # manual mode: bumps never reveal/place walls or doors
         attr = "door_shown" if door else "wall_shown"
-        if not door and self.manual_walls: return          # manual mode: the player places the wall marker himself
         nr, nc = step(r, c, d)
         self.grid[r][c].seen = True
         getattr(self.grid[r][c], attr)[d] = True
@@ -1496,8 +1515,9 @@ class App:
         if not cell.passable(d):
             is_door = cell.door_closed[d]
             self._mark_edge(p["row"], p["col"], d, is_door)
-            if is_door or not self.manual_walls: self._flash_wall(p["row"], p["col"], d, is_door)
-            self.snd.push("hitawall")                     # same "ouch" for walls and doors
+            if not self.manual_walls:
+                self._flash_wall(p["row"], p["col"], d, is_door)
+            self.snd.push("hitawall", pitch=DOOR_OUCH_PITCH if is_door else 1.0)  # lower pitch only for closed doors
             if is_door:
                 self._say("A closed door! You stay where you are and your turn is over. "
                           "Try again later: every door opens sooner or later.", "bad")
@@ -1624,12 +1644,17 @@ class App:
         self._dragon_attacks(v, lambda: self._advance_turn(p))
         return True
 
+    def _fatal_catch(self, v):
+        """True if the ghost's attack on `v` eliminates him: he carries the treasure, or he has just reached the
+        treasure square together with the ghost (he would have picked it up)."""
+        return bool(v["carrying"]) or ((v["row"], v["col"]) == (self.tr, self.tc) and not self._carrier())
+
     def _dragon_attacks(self, v, after):
         """The ghost lands on the victim's tile and the marker settles there; the marker stays put
         afterwards (the player can drag it), while the real ghost goes on moving."""
         self._locked = True
         self.dr, self.dc = v["row"], v["col"]
-        lethal = v["carrying"] or v["lives"] <= 1
+        lethal = self._fatal_catch(v) or v["lives"] <= 1
         last = lethal and not any(q is not v for q in self._live())
         if not last:        # on the LAST hero's death the marker is not placed: the player's guess stays his own
             self._ghost_panel_cell = (v["row"], v["col"])
@@ -1642,7 +1667,7 @@ class App:
         self._locked = False; self._attack_job = None
         if self.game_over: return
         n = self._idx(v) + 1
-        if v["carrying"]:                       # attacked while carrying the treasure: out of the game
+        if self._fatal_catch(v):                # caught with the treasure (or on its square): out of the game, the treasure stays in its room
             v["carrying"] = False; v["lives"] = 0
         else:                                   # lose a life, fewer moves, back to the Secret Room
             v["lives"] -= 1
@@ -1653,8 +1678,8 @@ class App:
             v["alive"] = False
             survivors = [i for i, q in enumerate(self.players) if q and q["alive"]]
             self.snd.push("gameover")
-            if survivors:                       # the other warrior carries on
-                self._say(f"Player {n} is out of the game. Player {survivors[0]+1} carries on.", "bad")
+            if survivors:                       # two players: the other warrior carries on; one player: game over
+                self._say(f"Player {n} is out of the game and the treasure is back in its room. Player {survivors[0]+1} carries on.", "bad")
                 self._update_panel(); self._full_redraw(); after(); return
             self.game_over = True; self.reveal_all = True; self.winner = None
             self._say("The ghost got you. Here is the map, and where it really was.", "bad")
