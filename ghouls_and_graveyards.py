@@ -2,7 +2,7 @@ import os, sys, math, random, threading, tempfile, wave, struct, time
 import importlib, subprocess
 from array import array
 VERSION = "1.5"
-debug_mode = True 
+debug_mode = False 
 
 def _ensure(module, pip_name=None):
     try:
