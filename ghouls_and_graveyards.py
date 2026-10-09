@@ -1,8 +1,8 @@
 import os, sys, math, random, threading, tempfile, wave, struct, time
 import importlib, subprocess
 from array import array
-VERSION = "1.4"
-debug_mode = False 
+VERSION = "1.5"
+debug_mode = True 
 
 def _ensure(module, pip_name=None):
     try:
@@ -192,6 +192,41 @@ def _warrior_tune_path(idx):
         return None
 
 
+def _sword_clash_path():
+    try:
+        d = os.path.join(tempfile.gettempdir(), "ghouls_tunes")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "swordfight.wav")
+        if not os.path.exists(path):
+            rate = 22050
+            hits = [(0.00, 1650, 0.8, 0.22), (0.17, 1900, 0.9, 0.22), (0.31, 1500, 0.8, 0.22),
+                    (0.50, 2100, 1.0, 0.45)]
+            partials = [(1.00, 1.0), (1.58, 0.7), (2.76, 0.55), (4.07, 0.35), (5.43, 0.2)]
+            total = int(rate * 1.05)
+            buf = [0.0] * total
+            rnd = random.Random(7)
+            for t0, f0, amp, ring in hits:
+                start = int(t0 * rate); n = int(ring * rate)
+                prev = 0.0
+                for k in range(n):
+                    if start + k >= total: break
+                    t = k / rate
+                    tone = sum(a * math.sin(2*math.pi*f0*r*t) for r, a in partials)
+                    tone *= math.exp(-t * 7.0 / ring) * min(1.0, k / (rate * 0.0008))
+                    x = rnd.uniform(-1, 1)
+                    noise = (x - prev) * math.exp(-t * 400.0)
+                    prev = x
+                    buf[start + k] += amp * (0.22 * tone + 0.5 * noise)
+            peak = max(abs(v) for v in buf) or 1.0
+            frames = b"".join(struct.pack("<h", int(32767 * 0.7 * v / peak)) for v in buf)
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+                w.writeframes(frames)
+        return path
+    except Exception:
+        return None
+
+
 def _build_audio_backend():
     miniaudio = _ensure("miniaudio")
     if miniaudio is None:
@@ -304,7 +339,7 @@ class SoundQueue:
 
     def push_duel(self, winner_idx, caption):
         self.on_caption(caption)
-        _audio_play([_warrior_tune_path(winner_idx), self._path("foundtreasure")])
+        _audio_play([_sword_clash_path(), self._path("foundtreasure")])
 
     def clear(self): _audio_play([], priority=True)
     def busy(self): return _audio_busy()
@@ -1480,10 +1515,10 @@ class App:
 
         if l["carrying"]:
             l["carrying"] = False
+            l["max_steps"] = STEPS_BY_LIVES.get(l["lives"], 8)
             w["carrying"] = True
             w["max_steps"] = TREASURE_STEPS
 
-        l["row"], l["col"] = l["base_r"], l["base_c"]
         l["used_steps"] = l["max_steps"]
         self.snd.push_duel(w_idx, f"Player {w_idx+1} defeats Player {l_idx+1} in a duel!")
         self.root.after(800, self._clear_duel)
@@ -1554,19 +1589,10 @@ class App:
                 self._ghost_hold[1] -= 1; return False
             self._ghost_hold = None
         out = [q for q in self._live() if not self._in_own_base(q)]
-        if not out:
-            target_r, target_c = self.tr, self.tc
-            if (self.dr, self.dc) == (target_r, target_c):
-                return False
-        else:
-            goal = self._carrier() or min(
-                out,
-                key=lambda q: dragon_distance(self.dr, self.dc, q["row"], q["col"]),
-                default=None,
-            )
-            target_r, target_c = ((goal["row"], goal["col"]) if goal else (self.tr, self.tc))
+        goal = self._carrier() or min(
+            out, key=lambda q: dragon_distance(self.dr, self.dc, q["row"], q["col"]), default=None)
+        tr, tc = (goal["row"], goal["col"]) if goal else (self.tr, self.tc)
 
-        tr, tc = target_r, target_c
         if (self.dr, self.dc) != (tr, tc):
             self.dr += (tr > self.dr) - (tr < self.dr)
             self.dc += (tc > self.dc) - (tc < self.dc)
